@@ -1,0 +1,41 @@
+# Hermes Agent config snippet for llama.cpp backend
+#
+# Copy these values into your ~/.hermes/config.yaml under the model: section
+# Or use: hermes config edit
+#
+# This config points Hermes at a local llama.cpp server running Qwen3 8B
+# with 32K context — the recommended setup for a 16 GB Apple Silicon Mac
+# when you want maximum performance via a Metal-optimized build.
+
+model:
+  # Use "custom" for any OpenAI-compatible endpoint
+  provider: custom
+  
+  # llama.cpp server's OpenAI-compatible API endpoint
+  base_url: "http://localhost:8080/v1"
+  
+  # llama.cpp server doesn't require an API key by default
+  api_key: ""
+  
+  # Model name — check what your server reports with:
+  # curl http://localhost:8080/v1/models
+  default: "qwen3-8b"
+  
+  # Match the context length we set with -c 32768 on the server
+  # This tells Hermes to start compressing context at ~16K tokens (50% threshold)
+  context_length: 32768
+
+# Optional: auxiliary model configuration
+# Same notes as the Ollama config — see hermes-ollama-config.yaml
+#
+# auxiliary:
+#   compression:
+#     provider: custom
+#     base_url: "http://localhost:8080/v1"
+#     model: "qwen3-8b"
+#     timeout: 120
+#   title_generation:
+#     provider: custom
+#     base_url: "http://localhost:8080/v1"
+#     model: "qwen3-8b"
+#     timeout: 30
