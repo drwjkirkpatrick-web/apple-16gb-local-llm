@@ -1,236 +1,177 @@
 # Chapter 1: Ollama Setup (Easy Path)
 
-The fastest way to get a local LLM running on a 16 GB Apple Silicon Mac. Three commands, five minutes, no compiling.
+Get a local LLM serving **64K context** on a 16 GB Apple Silicon Mac without
+compiling anything. Five steps; the fourth is the one that matters.
+
+Hermes Agent requires at least 64,000 tokens of context, so the window is fixed
+up front. What varies is whether that window fits in memory — and that comes down
+to the KV cache type.
 
 ---
 
 ## Why Ollama
 
-Ollama is a background service that manages local model files, handles Metal GPU acceleration automatically, and exposes an OpenAI-compatible API. It does for local LLMs what Docker did for containers — wraps the complexity in a clean CLI.
+Ollama wraps model files, Metal acceleration and an OpenAI-compatible API behind
+one CLI. For a 16 GB Mac:
 
-For a 16 GB Mac, Ollama is the right default choice because:
-- **Zero build step** — pre-compiled binary, Metal support built in
-- **Automatic memory management** — loads/unloads models as needed
-- **OpenAI-compatible API** — Hermes can talk to it directly, no adapter needed
-- **Model versioning** — creates custom model variants (like our 32K context config) with a one-liner
+- **Zero build step** — pre-compiled with Metal support
+- **Model variants** — a one-liner creates a 64K context derivate
+- **OpenAI-compatible API** — Hermes talks to it directly
+- **One catch** — KV cache precision is a *server* setting, not a model setting
+
+That last point is where most 64K-on-16-GB attempts fail. Read Step 2 carefully.
 
 ---
 
-## Step 1: Install Ollama
-
-### Option A: Homebrew (recommended)
+## Step 1: Install and start Ollama
 
 ```bash
 brew install ollama
-```
-
-### Option B: Direct download
-
-Download the installer from [ollama.com](https://ollama.com/download/mac) and run it.
-
-### Verify installation
-
-```bash
-ollama --version
-# Should print something like: ollama version 0.x.x
-```
-
----
-
-## Step 2: Start the Ollama service
-
-```bash
-# Start as background service (persists across reboots)
 brew services start ollama
 
-# Or run manually in a terminal (stops when you close the window)
-ollama serve
-```
-
-Ollama listens on `http://localhost:11434` by default.
-
-### Verify the service is running
-
-```bash
-curl http://localhost:11434/api/version
-# Should return: {"version":"0.x.x"}
+# verify
+curl -s http://localhost:11434/api/version
 ```
 
 ---
 
-## Step 3: Pull Qwen3 8B
+## Step 2: Enable an 8-bit KV cache (the critical step)
+
+At 64K context, Qwen3 8B's KV cache costs 9.00 GiB at Ollama's default `f16`.
+That does not fit alongside 4.7 GiB of weights and macOS. Quantized to q8_0 it
+costs 4.78 GiB, which does.
+
+```bash
+export OLLAMA_FLASH_ATTENTION=1     # required for a quantized cache
+export OLLAMA_KV_CACHE_TYPE=q8_0    # f16 -> q8_0: 9.00 GiB -> 4.78 GiB
+export OLLAMA_CONTEXT_LENGTH=65536  # default context for any model loaded
+```
+
+Persist these, because `brew services` runs Ollama through launchd and **launchd
+does not read your shell profile**:
+
+```bash
+# for GUI/launchd-started processes
+launchctl setenv OLLAMA_FLASH_ATTENTION 1
+launchctl setenv OLLAMA_KV_CACHE_TYPE q8_0
+launchctl setenv OLLAMA_CONTEXT_LENGTH 65536
+
+# for a manually started server
+echo 'export OLLAMA_FLASH_ATTENTION=1'  >> ~/.zshrc
+echo 'export OLLAMA_KV_CACHE_TYPE=q8_0' >> ~/.zshrc
+echo 'export OLLAMA_CONTEXT_LENGTH=65536' >> ~/.zshrc
+
+brew services restart ollama
+```
+
+`scripts/setup-ollama.sh` does all of the above for you, idempotently, and then
+verifies the result. Use it if you would rather not hand-edit anything.
+
+---
+
+## Step 3: Pull Qwen3 8B and create the 64K variant
 
 ```bash
 ollama pull qwen3:8b
-```
 
-This downloads the Q4_K_M quantized version (~5 GB). On a decent connection it takes 5–10 minutes.
-
-The model file is stored at `~/.ollama/models/`. You can see all downloaded models with:
-
-```bash
-ollama list
-```
-
----
-
-## Step 4: Create a 32K context variant
-
-The default Qwen3 8B in Ollama ships with 4096 token context. That's far too small for Hermes — the system prompt alone is 2–4K tokens. We need 32K.
-
-Ollama lets you create a custom model variant with different parameters:
-
-```bash
-ollama create qwen3-8b-32k -f - <<'EOF'
+ollama create qwen3-8b-64k -f - <<'EOF'
 FROM qwen3:8b
-PARAMETER num_ctx 32768
+PARAMETER num_ctx 65536
+PARAMETER keep_alive 30m
 EOF
 ```
 
-This creates a new model entry called `qwen3-8b-32k` that's identical to `qwen3:8b` but with 32K context. It doesn't duplicate the 5 GB model file — it just stores the parameter override.
-
-### Verify it works
-
-```bash
-ollama run qwen3-8b-32k "Hello, what model are you?"
-```
-
-You should see a response from Qwen3. Press Ctrl+D to exit the chat.
+`num_ctx` is what Ollama actually allocates — the model's advertised maximum is
+irrelevant. `keep_alive 30m` stops Ollama unloading the 5 GB model between
+requests.
 
 ---
 
-## Step 5: Install Hermes Agent
-
-If you haven't already:
+## Step 4: Verify the running window, not the config
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+ollama run qwen3-8b-64k "say ok"      # force a load, then Ctrl+D
+
+ollama ps
+#   NAME              SIZE     PROCESSOR   CONTEXT
+#   qwen3-8b-64k      5.9 GB   100% GPU    65536      <- this must be >= 64000
 ```
 
-Verify:
+If `CONTEXT` is smaller than 64,000, the KV cache variables did not reach the
+server. Confirm by hand with them exported in front:
 
 ```bash
-hermes --version
+OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 OLLAMA_CONTEXT_LENGTH=65536 ollama serve
 ```
 
 ---
 
-## Step 6: Point Hermes at Ollama
-
-### Interactive setup
+## Step 5: Install Hermes and point it at Ollama
 
 ```bash
-hermes model
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+
+hermes model    # → Custom endpoint (self-hosted / vLLM / llama.cpp)
+#   Base URL:        http://127.0.0.1:11434/v1
+#   API key:         (leave blank)
+#   Model:           qwen3-8b-64k
+#   Context length:  65536        <- must be >= 64000
 ```
 
-Select these options:
-1. **Custom endpoint (self-hosted / VLLM / etc.)**
-2. **Base URL**: `http://localhost:11434/v1`
-3. **API key**: leave blank (Ollama doesn't need one)
-4. **Model name**: `qwen3-8b-32k`
-
-### Or edit config.yaml directly
-
-```bash
-hermes config edit
-```
-
-Find the `model:` section and set:
+Or edit `~/.hermes/config.yaml` (`hermes config edit`):
 
 ```yaml
 model:
   provider: custom
-  base_url: "http://localhost:11434/v1"
+  base_url: "http://127.0.0.1:11434/v1"
   api_key: ""
-  default: "qwen3-8b-32k"
-  context_length: 32768
+  default: "qwen3-8b-64k"
+  context_length: 65536
 ```
+
+A ready-to-paste version lives in `scripts/hermes-ollama-config.yaml`, including
+a compression threshold of 0.45 so the cache never actually fills to 64K.
 
 ---
 
-## Step 7: Test the setup
+## Test it
 
 ```bash
-# Quick single-query test
 hermes chat -q "What tools do you have available?"
-
-# Start interactive chat
-hermes chat
+hermes doctor
 ```
 
-If Hermes responds and can call tools (like reading a file or running a command), you're done.
-
----
-
-## Step 8: Set context length in Hermes config
-
-Even though Ollama is configured for 32K, Hermes also needs to know:
-
-```bash
-hermes config edit
-```
-
-Ensure this is set:
-
-```yaml
-model:
-  context_length: 32768
-```
-
-This tells Hermes to start compressing context at ~16K tokens (50% of 32K), which keeps memory usage safe.
+If Hermes starts and answers, you are done — it validated the 64K window on the
+way in.
 
 ---
 
 ## Troubleshooting
 
-### "Connection refused" from Hermes
+**Hermes refuses to start: context too small**
+`ollama ps` is showing less than 64,000. Fix the server, not Hermes. Usually
+`OLLAMA_KV_CACHE_TYPE` never reached the process — see Step 2.
 
-Ollama isn't running. Start it:
-```bash
-ollama serve
-# or
-brew services start ollama
-```
+**The Mac swaps**
+The cache did not quantize (check `ollama ps` size against ~5.9 GB — an f16 cache
+at 64K inflates it several GB), or other apps are eating memory. Close browsers
+and Docker.
 
-### Model loads slowly / Mac feels sluggish
+**Out of memory with the cache applied**
+Drop the request's cache to 4-bit: `OLLAMA_KV_CACHE_TYPE=q4_0` (2.53 GiB at 64K).
+Quality on long context suffers, but it fits.
 
-The 5 GB model is loading into memory. First request after idle is always slow. Ollama keeps the model loaded for 5 minutes by default after last use. To keep it loaded longer:
+**Model unloads and reloads constantly**
+Increase `keep_alive` in the modelfile, or set `OLLAMA_KEEP_ALIVE=30m`.
 
-```bash
-ollama create qwen3-8b-32k -f - <<'EOF'
-FROM qwen3:8b
-PARAMETER num_ctx 32768
-PARAMETER keep_alive 30m
-EOF
-```
-
-### Out of memory errors
-
-If macOS is swapping heavily or Ollama crashes:
-1. Close memory-heavy apps (browsers with many tabs, Docker, etc.)
-2. Reduce context to 16K:
-   ```bash
-   ollama create qwen3-8b-16k -f - <<'EOF'
-   FROM qwen3:8b
-   PARAMETER num_ctx 16384
-   EOF
-   ```
-3. Update Hermes config: `context_length: 16384`
-
-### Hermes says model not found
-
-Make sure you're using the exact model name:
-```bash
-ollama list
-# Should show: qwen3-8b-32k
-```
-
-If the name doesn't match what you entered in Hermes config, update the config.
+**Context silently clamped below what you asked for**
+Ollama reduces `num_ctx` when the cache will not fit. That is a signal the q8_0
+cache type is not active.
 
 ---
 
 ## What's next
 
-- Read [Chapter 2](02-llamacpp-setup.md) if you want ~15–20% faster inference by compiling llama.cpp from source
-- Read [Why Qwen3 8B](03-model-selection.md) to understand the model choice
-- Read [Why 32K context](04-context-length.md) to understand the context window decision
+- [Chapter 2](02-llamacpp-setup.md) — the same 64K setup on llama.cpp, ~15–20% faster
+- [Why Qwen3 8B](03-model-selection.md) — the model choice
+- [Why 64K and q8_0](04-context-length.md) — the arithmetic behind all of this

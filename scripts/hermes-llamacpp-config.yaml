@@ -1,41 +1,49 @@
-# Hermes Agent config snippet for llama.cpp backend
+# Hermes Agent config snippet for llama.cpp backend — 64K context
 #
-# Copy these values into your ~/.hermes/config.yaml under the model: section
-# Or use: hermes config edit
+# Copy these values into ~/.hermes/config.yaml under the model: section,
+# or use: hermes config edit
 #
-# This config points Hermes at a local llama.cpp server running Qwen3 8B
-# with 32K context — the recommended setup for a 16 GB Apple Silicon Mac
-# when you want maximum performance via a Metal-optimized build.
+# Points Hermes at a local llama.cpp server running Qwen3 8B at 65,536 tokens
+# of context with a q8_0 KV cache — the configuration for a 16 GB Apple Silicon
+# Mac. Start the server with: bash scripts/launch-llm-64k.sh
 
 model:
-  # Use "custom" for any OpenAI-compatible endpoint
+  # "custom" = any OpenAI-compatible endpoint
   provider: custom
-  
-  # llama.cpp server's OpenAI-compatible API endpoint
-  base_url: "http://localhost:8080/v1"
-  
-  # llama.cpp server doesn't require an API key by default
-  api_key: ""
-  
-  # Model name — check what your server reports with:
-  # curl http://localhost:8080/v1/models
-  default: "qwen3-8b"
-  
-  # Match the context length we set with -c 32768 on the server
-  # This tells Hermes to start compressing context at ~16K tokens (50% threshold)
-  context_length: 32768
 
-# Optional: auxiliary model configuration
-# Same notes as the Ollama config — see hermes-ollama-config.yaml
+  # llama-server's OpenAI-compatible API
+  base_url: "http://127.0.0.1:8080/v1"
+
+  # llama-server needs no API key by default
+  api_key: ""
+
+  # Check what the server calls itself: curl http://127.0.0.1:8080/v1/models
+  default: "qwen3-8b"
+
+  # MUST be >= 64000. Hermes rejects any model whose context window is smaller
+  # (MINIMUM_CONTEXT_LENGTH = 64000 in agent/model_metadata.py) and will not
+  # start. Match the server's -c value.
+  context_length: 65536
+
+# Compression: on a 16 GB Mac, compress earlier than the default so the KV cache
+# never actually fills to 64K. 0.45 triggers at ~29K tokens.
+compression:
+  enabled: true
+  threshold: 0.45
+  target_ratio: 0.20
+
+# Optional: pin compression/title generation to the same local model instead of
+# a cloud provider. Costs extra load on the 16 GB machine, so it is commented
+# out by default — leave these as "auto" unless you are fully offline.
 #
 # auxiliary:
 #   compression:
 #     provider: custom
-#     base_url: "http://localhost:8080/v1"
+#     base_url: "http://127.0.0.1:8080/v1"
 #     model: "qwen3-8b"
-#     timeout: 120
+#     timeout: 180
 #   title_generation:
 #     provider: custom
-#     base_url: "http://localhost:8080/v1"
+#     base_url: "http://127.0.0.1:8080/v1"
 #     model: "qwen3-8b"
 #     timeout: 30

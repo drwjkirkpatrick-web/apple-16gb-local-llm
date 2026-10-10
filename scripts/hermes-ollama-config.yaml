@@ -1,41 +1,51 @@
-# Hermes Agent config snippet for Ollama backend
-# 
-# Copy these values into your ~/.hermes/config.yaml under the model: section
-# Or use: hermes config edit
+# Hermes Agent config snippet for Ollama backend — 64K context
 #
-# This config points Hermes at a local Ollama instance running Qwen3 8B
-# with 32K context — the recommended setup for a 16 GB Apple Silicon Mac.
+# Copy these values into ~/.hermes/config.yaml under the model: section,
+# or use: hermes config edit
+#
+# Points Hermes at a local Ollama instance running Qwen3 8B at 65,536 tokens of
+# context. Two things must both be true for that to fit in 16 GB:
+#   1. the model variant sets num_ctx 65536     (setup-ollama.sh creates it)
+#   2. the Ollama server runs with an 8-bit KV cache:
+#          OLLAMA_FLASH_ATTENTION=1
+#          OLLAMA_KV_CACHE_TYPE=q8_0
+#      KV cache type is a server setting in Ollama, not a modelfile parameter.
 
 model:
-  # Use "custom" for any OpenAI-compatible endpoint (Ollama, vLLM, llama.cpp, etc.)
+  # "custom" = any OpenAI-compatible endpoint (Ollama, vLLM, llama.cpp, ...)
   provider: custom
-  
-  # Ollama's OpenAI-compatible API endpoint
-  base_url: "http://localhost:11434/v1"
-  
-  # Ollama doesn't require an API key
-  api_key: ""
-  
-  # The model name we created with: ollama create qwen3-8b-32k
-  default: "qwen3-8b-32k"
-  
-  # Match the context length we set in the Ollama modelfile (32768)
-  # This tells Hermes to start compressing context at ~16K tokens (50% threshold)
-  context_length: 32768
 
-# Optional: auxiliary model configuration
-# These tasks (compression, title generation) can use the same local model
-# to avoid any API calls. On a 16 GB Mac this adds load, so you may prefer
-# to leave these as "auto" (uses your main model) or comment them out.
+  # Ollama's OpenAI-compatible API
+  base_url: "http://127.0.0.1:11434/v1"
+
+  # Ollama needs no API key
+  api_key: ""
+
+  # The variant created by: ollama create qwen3-8b-64k
+  default: "qwen3-8b-64k"
+
+  # MUST be >= 64000. Hermes rejects smaller context windows outright
+  # (MINIMUM_CONTEXT_LENGTH = 64000 in agent/model_metadata.py).
+  context_length: 65536
+
+# Compression: on a 16 GB Mac, compress earlier than the default so the KV cache
+# never actually fills to 64K. 0.45 triggers at ~29K tokens.
+compression:
+  enabled: true
+  threshold: 0.45
+  target_ratio: 0.20
+
+# Optional: fully offline auxiliary models. Adds load on a 16 GB machine —
+# leave as "auto" unless you need zero network access.
 #
 # auxiliary:
 #   compression:
 #     provider: custom
-#     base_url: "http://localhost:11434/v1"
-#     model: "qwen3-8b-32k"
-#     timeout: 120
+#     base_url: "http://127.0.0.1:11434/v1"
+#     model: "qwen3-8b-64k"
+#     timeout: 180
 #   title_generation:
 #     provider: custom
-#     base_url: "http://localhost:11434/v1"
-#     model: "qwen3-8b-32k"
+#     base_url: "http://127.0.0.1:11434/v1"
+#     model: "qwen3-8b-64k"
 #     timeout: 30

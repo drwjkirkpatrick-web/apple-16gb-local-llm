@@ -1,125 +1,147 @@
-#!/bin/bash
-# build-llamacpp.sh — Build llama.cpp with Metal support on Apple Silicon
-# Usage: bash build-llamacpp.sh
+#!/usr/bin/env bash
+# =============================================================================
+#  build-llamacpp.sh — build llama.cpp with Metal support on Apple Silicon
+# =============================================================================
+#  Builds llama.cpp from source, verifies the build supports quantized KV
+#  caches (-ctk/-ctv), fetches Qwen3 8B Q4_K_M if it is missing, and prints the
+#  64K launch command. You need a build from 2025 or later: KV cache
+#  quantization is what lets 64K context fit in 16 GB.
+#
+#  Usage:  bash build-llamacpp.sh
+# =============================================================================
 set -euo pipefail
 
-echo "═══════════════════════════════════════════════"
-echo "  llama.cpp Build with Metal for Apple Silicon"
-echo "═══════════════════════════════════════════════"
-echo ""
+MODEL_DIR="$HOME/models"
+MODEL_FILE="$MODEL_DIR/Qwen3-8B-Q4_K_M.gguf"
+LLAMA_DIR="$HOME/llama.cpp"
+CTX=65536
 
-# ---- Step 1: Check prerequisites ----
-echo "[…] Checking prerequisites..."
+ok()   { printf '[✓] %s\n' "$*"; }
+info() { printf '[…] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*"; }
+die()  { printf '[✗] %s\n' "$*" >&2; exit 1; }
 
-if ! xcode-select -p &>/dev/null; then
-    echo "[!] Xcode Command Line Tools not found."
-    echo "    Install with: xcode-select --install"
-    exit 1
+# Bounded "--help" probe (macOS has no GNU timeout(1)).
+help_text() {
+    local tmp pid i=0
+    tmp="$(mktemp)"
+    "$1" --help >"$tmp" 2>&1 &
+    pid=$!
+    while [ "$i" -lt 10 ]; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+        i=$((i + 1))
+    done
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    cat "$tmp"
+    rm -f "$tmp"
+}
+
+printf '%s\n' "═══════════════════════════════════════════════════════════════"
+printf '%s\n' "  llama.cpp build for Apple Silicon (Metal)"
+printf '%s\n' "═══════════════════════════════════════════════════════════════"
+
+# ---- 1. Prerequisites ------------------------------------------------------
+info "Checking prerequisites..."
+if ! xcode-select -p >/dev/null 2>&1; then
+    die "Xcode Command Line Tools missing. Run: xcode-select --install"
 fi
-echo "[✓] Xcode Command Line Tools present"
+ok "Xcode Command Line Tools present"
 
-if ! command -v cmake &>/dev/null; then
-    echo "[…] Installing CMake via Homebrew..."
-    if ! command -v brew &>/dev/null; then
-        echo "[!] Homebrew not found. Install from https://brew.sh first."
-        exit 1
-    fi
+if ! command -v cmake >/dev/null 2>&1; then
+    command -v brew >/dev/null 2>&1 || die "Homebrew not found. Install from https://brew.sh first."
+    info "Installing CMake via Homebrew..."
     brew install cmake
 fi
-echo "[✓] CMake: $(cmake --version | head -1)"
+ok "CMake: $(cmake --version | head -1)"
 
-# ---- Step 2: Clone or update llama.cpp ----
-LLAMA_DIR="$HOME/llama.cpp"
-
+# ---- 2. Source -------------------------------------------------------------
 if [ -d "$LLAMA_DIR/.git" ]; then
-    echo "[…] Updating existing llama.cpp clone..."
-    cd "$LLAMA_DIR"
-    git pull
+    info "Updating existing llama.cpp checkout..."
+    git -C "$LLAMA_DIR" pull --ff-only || warn "git pull failed — building what is on disk"
 else
-    echo "[…] Cloning llama.cpp..."
-    cd "$HOME"
-    git clone https://github.com/ggml-org/llama.cpp.git
-    cd "$LLAMA_DIR"
+    info "Cloning llama.cpp..."
+    git clone https://github.com/ggml-org/llama.cpp.git "$LLAMA_DIR"
 fi
-echo "[✓] llama.cpp source ready"
+ok "Source ready at $LLAMA_DIR (commit $(git -C "$LLAMA_DIR" rev-parse --short HEAD))"
 
-# ---- Step 3: Build ----
-echo ""
-echo "[…] Building with Metal support..."
-echo "    This takes 2–5 minutes depending on your Mac."
+# ---- 3. Build with Metal ---------------------------------------------------
+info "Building with Metal support (2–5 minutes)..."
+mkdir -p "$LLAMA_DIR/build"
+cd "$LLAMA_DIR/build"
+CPU_CORES="$(sysctl -n hw.ncpu)"
+info "Using $CPU_CORES CPU cores"
 
-mkdir -p build
-cd build
-
-CPU_CORES=$(sysctl -n hw.ncpu)
-echo "    Using $CPU_CORES CPU cores for compilation"
-
-cmake .. \
+cmake "$LLAMA_DIR" \
     -DGGML_METAL=ON \
     -DGGML_METAL_USE_BMETAL=ON \
     -DGGML_NATIVE=ON \
     -DCMAKE_BUILD_TYPE=Release
-
 cmake --build . --config Release -j "$CPU_CORES"
+ok "Build complete"
 
-echo "[✓] Build complete"
+# ---- 4. Verify the build can do what we need -------------------------------
+SERVER="$LLAMA_DIR/build/bin/llama-server"
+[ -x "$SERVER" ] || die "llama-server not found at $SERVER — build failed."
 
-# ---- Step 4: Verify Metal ----
-echo ""
-echo "[…] Verifying Metal GPU support..."
-if ./bin/llama-cli --help 2>&1 | grep -qi "metal"; then
-    echo "[✓] Metal support detected in build"
-else
-    # Try running with a dummy to see if Metal initializes
-    echo "[?] Checking Metal via verbose output..."
-    echo "    If inference is slow, Metal may not be working."
-    echo "    Rebuild with: cmake .. -DGGML_METAL=ON"
-fi
+SERVER_HELP="$(help_text "$SERVER")"
+case "$SERVER_HELP" in
+    *--cache-type-k*) ok "Build supports quantized KV cache (-ctk/-ctv)" ;;
+    *) die "This build has no --cache-type-k option, so it cannot hold 64K in 16 GB.
+    Make sure you cloned the current master branch and rebuilt from scratch:
+        rm -rf $LLAMA_DIR/build && bash $0" ;;
+esac
 
-# ---- Step 5: Check for model file ----
-MODEL_DIR="$HOME/models"
-MODEL_FILE="$MODEL_DIR/qwen3-8b-q4_k_m.gguf"
+case "$SERVER_HELP" in
+    *--flash-attn*) ok "Build supports --flash-attn (required for a quantized V cache)" ;;
+    *) warn "No --flash-attn flag found — an old build. A quantized V cache needs it." ;;
+esac
 
-echo ""
+# ---- 5. Model --------------------------------------------------------------
 if [ -f "$MODEL_FILE" ]; then
-    echo "[✓] Model file found: $MODEL_FILE"
+    ok "Model present: $MODEL_FILE ($(du -h "$MODEL_FILE" | cut -f1))"
 else
-    echo "[!] Model file not found at $MODEL_FILE"
-    echo "    Download from HuggingFace:"
-    echo "    https://huggingface.co/Qwen/Qwen3-8B-Instruct-GGUF"
-    echo "    Look for: qwen3-8b-instruct-q4_k_m.gguf (~5 GB)"
-    echo ""
-    echo "    Or use curl:"
-    echo "    mkdir -p $MODEL_DIR"
-    echo "    curl -L -o $MODEL_FILE \\"
-    echo "      'https://huggingface.co/Qwen/Qwen3-8B-Instruct-GGUF/resolve/main/qwen3-8b-instruct-q4_k_m.gguf'"
+    warn "Model missing at $MODEL_FILE"
+    mkdir -p "$MODEL_DIR"
+    if command -v hf >/dev/null 2>&1; then
+        info "Downloading Qwen3 8B Q4_K_M (~5 GB) with the Hugging Face CLI..."
+        hf download Qwen/Qwen3-8B-GGUF --include '*Q4_K_M*' --local-dir "$MODEL_DIR"
+    elif command -v huggingface-cli >/dev/null 2>&1; then
+        info "Downloading Qwen3 8B Q4_K_M (~5 GB)..."
+        huggingface-cli download Qwen/Qwen3-8B-GGUF --include '*Q4_K_M*' --local-dir "$MODEL_DIR"
+    else
+        cat <<EOF
+
+  No Hugging Face CLI found. Either install it:
+      pipx install 'huggingface_hub[cli]'
+  or download the Q4_K_M GGUF by hand from:
+      https://huggingface.co/Qwen/Qwen3-8B-GGUF
+  and save it as: $MODEL_FILE
+EOF
+    fi
 fi
 
-# ---- Step 6: Print launch instructions ----
-echo ""
-echo "═══════════════════════════════════════════════"
-echo "  ✅ llama.cpp build complete!"
-echo "═══════════════════════════════════════════════"
-echo ""
-echo "Start the server:"
-echo "  cd $LLAMA_DIR/build"
-echo "  ./bin/llama-server \\"
-echo "    -m $MODEL_FILE \\"
-echo "    --host 127.0.0.1 \\"
-echo "    --port 8080 \\"
-echo "    -ngl 99 \\"
-echo "    -c 32768"
-echo ""
-echo "Or create a launch script:"
-echo "  cp scripts/start-llm-template.sh ~/start-llm.sh"
-echo "  chmod +x ~/start-llm.sh"
-echo ""
-echo "Then configure Hermes:"
-echo "  hermes model"
-echo "  → Custom endpoint"
-echo "  → URL: http://localhost:8080/v1"
-echo "  → API key: (leave blank)"
-echo "  → Model: qwen3-8b"
-echo ""
-echo "See docs/02-llamacpp-setup.md for full instructions."
-echo "═══════════════════════════════════════════════"
+# ---- 6. Hand off -----------------------------------------------------------
+cat <<EOF
+
+═══════════════════════════════════════════════════════════════
+  ✅ Build finished — start it at 64K with the launcher
+═══════════════════════════════════════════════════════════════
+
+  bash scripts/launch-llm-64k.sh
+
+It runs this, checks the server is healthy, and confirms it really reports
+${CTX} tokens before telling you the Hermes settings:
+
+  $SERVER \\
+    -m $MODEL_FILE \\
+    -c $CTX -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -np 1 \\
+    --host 127.0.0.1 --port 8080
+
+  Then, in Hermes: custom endpoint, base_url http://127.0.0.1:8080/v1,
+  model qwen3-8b, context_length ${CTX}.
+
+  Full walkthrough: docs/02-llamacpp-setup.md
+═══════════════════════════════════════════════════════════════
+EOF

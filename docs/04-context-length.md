@@ -1,190 +1,175 @@
-# Why 32K Context
+# Why 64K Context and an 8-bit KV Cache
 
-The context window decision for a 16 GB Mac is a tight optimization problem. Here's the full analysis.
-
----
-
-## What context window means
-
-The context window is how many tokens (roughly word-pieces) the model can "see" at once. This includes:
-
-| Component | Approximate tokens |
-|-----------|-------------------|
-| System prompt (Hermes instructions) | 2,000–4,000 |
-| User profile + memory injection | 500–2,000 |
-| One loaded skill | 1,000–5,000 |
-| Conversation history | Grows over time |
-| Tool results (web pages, file contents, command output) | Variable — can be large |
-| Model's response | Being generated |
-
-**At session start**, before you've even said anything, Hermes has already consumed 5–10K tokens of context. Every tool call adds more.
+Hermes sets the target and the hardware sets the ceiling. Here is the arithmetic
+that lands on exactly one configuration.
 
 ---
 
-## The memory cost of context
+## The floor: 64,000 tokens
 
-The KV cache is the memory the model uses to store its "working memory" — the tokens it's seen so far in the current context. It grows linearly with context length.
+Hermes Agent will not run on less:
 
-For Qwen3 8B (32 layers, GQA with 8 KV heads, 128 head dim):
+```python
+# agent/model_metadata.py
+MINIMUM_CONTEXT_LENGTH = 64_000
+```
 
-| Context length | FP16 KV cache | Q8 KV cache |
-|----------------|---------------|-------------|
-| 4K | ~0.5 GB | ~0.25 GB |
-| 8K | ~1 GB | ~0.5 GB |
-| 16K | ~2 GB | ~1 GB |
-| **32K** | **~4 GB** | **~2 GB** |
-| 64K | ~8 GB | ~4 GB |
-| 128K | ~16 GB | ~8 GB |
+A session, a model switch or a cron job against a smaller window is rejected —
+the framework decides the model cannot hold enough working memory for multi-step
+tool calling. This is enforced at agent init, so a model served with a smaller
+window does not "work but feel cramped"; Hermes never starts.
 
-After the ~5 GB model weights, we have ~3–5 GB for KV cache on a 16 GB Mac.
-
----
-
-## Why 32K, not 64K or 128K
-
-### 128K is impossible
-
-128K FP16 KV cache = ~16 GB. That's the entire machine's RAM. Even at Q8 KV cache (~8 GB), combined with 5 GB weights = 13 GB, leaving 3 GB for macOS — which needs 6–8 GB. **The Mac would swap to SSD constantly, making everything slow.**
-
-### 64K is risky
-
-64K Q8 KV cache = ~4 GB. Plus 5 GB weights = 9 GB. That leaves 7 GB for macOS + Hermes + Python + terminal + any other apps. This is tight enough that:
-
-- Opening a browser with several tabs could push you into swap
-- Hermes's own Python process (1–2 GB) eats into the headroom
-- If the model processes a large tool result (like a web page extraction), the spike can cause OOM
-
-**64K works on paper, fails in practice on 16 GB.** You'll spend more time managing memory than using the agent.
-
-### 32K is the sweet spot
-
-32K Q8 KV cache = ~2 GB. Plus 5 GB weights = 7 GB. That leaves **~9 GB** for macOS, Hermes, and other apps. Comfortable margin.
-
-- macOS gets its 6–8 GB
-- Hermes + Python gets 1–2 GB
-- Browser, terminal, etc. fit in the remaining space
-- **No swap, no OOM, no crashes**
+For a local setup, that makes the context window a requirement, not a preference.
+Any guide that optimizes for the smallest workable window is optimizing for
+something Hermes cannot use.
 
 ---
 
-## Is 32K enough for Hermes?
+## The ceiling: what 16 GB can hold
 
-### What fits in 32K tokens
+An Apple Silicon Mac has unified memory, so the model, its cache, macOS and Hermes
+all draw from the same 16 GB.
 
-32K tokens is approximately:
-- ~24,000 words of text
-- ~480 lines of code (at ~50 chars/line)
-- ~60 pages of a book
-- A medium-length technical article or two
+| Component | Typical |
+|-----------|---------|
+| macOS + WindowServer + background apps | 3–4 GiB |
+| Hermes (Python, tools, session store) | 1–2 GiB |
+| Browser/editor/Docker, if you keep them open | 2–6 GiB |
+| **Available for the LLM** | **~10–11 GiB** |
 
-For most agent interactions, this is plenty:
+So the design problem is fitting weights + KV cache + compute buffers into roughly
+10.5 GiB, without leaving macOS so starved that it swaps to the SSD.
 
-| Scenario | Context used | Fits 32K? |
-|----------|-------------|-----------|
-| Simple Q&A | 5–8K | ✅ Easily |
-| Read a file + discuss it | 8–15K | ✅ Yes |
-| Web search + summarize results | 10–20K | ✅ Yes |
-| Multi-turn conversation (10–15 exchanges) | 15–25K | ✅ Yes |
-| Read a large code file + modify it | 20–28K | ⚠️ Getting tight |
-| Analyze an entire codebase | 30K+ | ❌ No |
+---
 
-### Hermes has compression
+## The KV cache: the number that actually decides this
 
-Hermes includes automatic context compression (configured in `config.yaml`):
+The cache is the model's working memory — one key and one value vector per token,
+per KV head, per layer. For Qwen3 8B (36 layers, 8 KV heads, head_dim 128):
+
+```
+per token = 2 (K and V) × 36 layers × 8 heads × 128 dims × bytes per element
+          = 73,728 elements per token
+```
+
+Block quantization adds a little overhead per 32 elements (a q8_0 block is 34
+bytes: a 2-byte scale plus 32 signed bytes):
+
+| KV cache type | Bytes/element | Per token | @ 65,536 tokens |
+|---------------|---------------|-----------|-----------------|
+| f32 | 4.0 | 288 KiB | 18.0 GiB |
+| f16 / bf16 (llama.cpp default) | 2.0 | 144 KiB | 9.00 GiB |
+| **q8_0** | **1.0625** | **76.5 KiB** | **4.78 GiB** |
+| q4_0 | 0.5625 | 40.5 KiB | 2.53 GiB |
+
+The entire problem in one line: **f16 needs 9.00 GiB for the cache alone, which
+plus 4.68 GiB of weights leaves macOS with nothing.** q8_0 brings the cache under
+5 GiB and the whole server to ~10.5 GiB, which fits — tightly, but genuinely.
+
+The launcher computes these numbers from your actual model file and GGUF header
+rather than assuming them.
+
+---
+
+## Why q8_0 and not q4_0
+
+q4_0 saves another 2.25 GiB, which is real headroom on this machine. It also
+quantizes the values the model attends over to 4 bits, and the loss shows up as
+degraded recall over long contexts — exactly the thing you paid 64K to get.
+
+Use q8_0 as the default. Drop to q4_0 only when you are swapping and cannot close
+anything else. The launcher accepts `CACHE_K=q4_0 CACHE_V=q4_0` for that case.
+
+---
+
+## Required settings, and why each one
+
+### llama.cpp
+
+```bash
+llama-server -m ~/models/Qwen3-8B-Q4_K_M.gguf   -c 65536 -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -np 1
+```
+
+| Flag | Why it is there |
+|------|-----------------|
+| `-c 65536` | The window Hermes requires. Hermes needs ≥64,000; 65,536 is the clean power-of-two equivalent |
+| `-ctk q8_0 -ctv q8_0` | Quantize the K and V caches. Without this, 64K does not fit |
+| `-fa on` | Flash attention. llama.cpp requires it for a quantized V cache and will abort without it |
+| `-ngl 99` | All layers on the Metal GPU (unified memory, so this is about compute, not VRAM) |
+| `-np 1` | One server slot. Slots do not share a cache: two slots means two 4.78 GiB caches |
+
+KV cache quantization needs a 2025-or-later llama.cpp build. `-ctk`/`-ctv` simply
+do not exist in older binaries, which is why `build-llamacpp.sh` checks for them
+and fails loudly instead of letting you discover it at 64K.
+
+### Ollama
+
+Ollama splits the same settings across two layers, which is why Ollama users
+routinely end up with a 9 GiB cache they did not ask for:
+
+```bash
+# 1. per model — the window
+ollama create qwen3-8b-64k -f - <<'EOF'
+FROM qwen3:8b
+PARAMETER num_ctx 65536
+EOF
+
+# 2. server-wide — the cache type. NOT a modelfile parameter.
+export OLLAMA_FLASH_ATTENTION=1
+export OLLAMA_KV_CACHE_TYPE=q8_0
+```
+
+`OLLAMA_KV_CACHE_TYPE` defaults to `f16` and is only honored with flash attention
+enabled. Environment variables must reach the *server* process — `brew services`
+starts Ollama through launchd, which does not read your shell profile, so
+`setup-ollama.sh` also calls `launchctl setenv`.
+
+---
+
+## The trained window, and RoPE scaling
+
+Qwen3 8B's GGUF declares a 40,960-token trained window. Asking for 65,536 without
+adjusting the position encoding stretches the model past what it was trained on,
+and attention quality drops.
+
+The launcher enables YaRN scaling automatically when `CTX` exceeds that declared
+window (`--rope-scaling yarn --rope-scale 1.6000 --yarn-orig-ctx 40960`, computed
+from your GGUF's own metadata), and leaves it alone otherwise. If your GGUF already
+carries baked-in scaling, pass `YARN=off`.
+
+---
+
+## Do not fill the window
+
+Clearing the 64K floor is not a reason to run at 64K of live context. Attention
+quality falls off at extreme lengths — the "lost in the middle" effect — and a
+full cache is also when memory pressure gets dangerous.
+
+The config snippets set Hermes to compress at 45% (~29K tokens):
 
 ```yaml
 compression:
   enabled: true
-  threshold: 0.50    # Compress when context hits 50% of limit
-  target_ratio: 0.20  # Compress to 20% of the threshold
+  threshold: 0.45
+  target_ratio: 0.20
 ```
 
-At 32K context:
-- Compression triggers at ~16K tokens of actual conversation
-- It summarizes older messages down to ~20% of their size
-- This gives you effectively much more than 32K of "wall clock conversation"
-
-For a 16 GB Mac, compression is your friend — it keeps memory usage bounded.
-
----
-
-## Why not just use the model's max (128K)?
-
-There's a second reason beyond memory: **small models degrade at long context.**
-
-An 8B model physically can attend to 128K tokens, but research shows that small models lose track of information in long contexts:
-
-- At 4K: full performance
-- At 16K: ~95% performance
-- At 32K: ~85% performance
-- At 64K: ~70% performance
-- At 128K: ~50% performance (or worse)
-
-This is sometimes called the "lost in the middle" problem — the model remembers the beginning and end of context but forgets the middle.
-
-**32K is the point where an 8B model is still performing well.** Pushing to 64K or 128K on a small model gives you more context capacity but less effective use of it. You'd have more tokens that the model is worse at using.
-
----
-
-## How to set 32K
-
-### In Ollama
-
-```bash
-ollama create qwen3-8b-32k -f - <<'EOF'
-FROM qwen3:8b
-PARAMETER num_ctx 32768
-EOF
-```
-
-### In llama.cpp
-
-```bash
-./bin/llama-server -m ~/models/qwen3-8b-q4_k_m.gguf -c 32768 -ngl 99
-```
-
-### In Hermes config
-
-```yaml
-model:
-  context_length: 32768
-```
-
-All three must agree. If Ollama says 128K but Hermes says 32K, Hermes will start compressing at 16K (50% of 32K) even though the model could hold more — this is actually fine and conservative. If Hermes says 128K but Ollama says 32K, the model will error when context exceeds 32K.
-
-**Match all three to 32K for consistency.**
-
----
-
-## When to reduce to 16K
-
-If the 16 GB Mac is also running other memory-intensive apps (Docker, large IDE, many browser tabs), you may need to drop to 16K context:
-
-| Context | Q8 KV cache | Total (weights + KV) | Free for OS |
-|---------|-------------|---------------------|-------------|
-| 16K | ~1 GB | ~6 GB | ~10 GB |
-| 32K | ~2 GB | ~7 GB | ~9 GB |
-| 64K | ~4 GB | ~9 GB | ~7 GB |
-
-16K is the safe fallback. You lose some conversation depth but gain stability.
-
-To switch:
-- Ollama: `PARAMETER num_ctx 16384`
-- llama.cpp: `-c 16384`
-- Hermes: `context_length: 16384`
+You get the large window for the moments that need it — pasted logs, a long file,
+a deep tool chain — while normal conversation stays in the range where an 8B model
+is sharp.
 
 ---
 
 ## Summary
 
-| | 16K | **32K** | 64K | 128K |
-|---|---|---|---|---|
-| KV cache (Q8) | ~1 GB | **~2 GB** | ~4 GB | ~8 GB |
-| Total with weights | ~6 GB | **~7 GB** | ~9 GB | ~13 GB |
-| Free for macOS | ~10 GB | **~9 GB** | ~7 GB | ~3 GB |
-| Model quality at this length | Good | **Good** | Degraded | Poor |
-| Hermes compression trigger | ~8K | **~16K** | ~32K | ~64K |
-| Risk of swap/OOM | None | **None** | Moderate | High |
-| **Verdict** | Safe fallback | **Recommended** | Risky | Don't |
+| | f16 KV @ 64K | **q8_0 KV @ 64K** | q4_0 KV @ 64K |
+|---|---|---|---|
+| KV cache | 9.00 GiB | **4.78 GiB** | 2.53 GiB |
+| Total with weights | 14.68 GiB | **10.47 GiB** | 8.22 GiB |
+| Left for macOS + Hermes | 1.32 GiB | **5.53 GiB** | 7.78 GiB |
+| Long-context recall | best | **~indistinguishable** | noticeably worse |
+| Survives a browser open? | no | **mostly** | yes |
+| Verdict | unusable | **use this** | emergency squeeze |
 
-**32K is the sweet spot: maximum context that fits comfortably in 16 GB with no performance risk, and the maximum at which an 8B model still performs well.**
+**64K at q8_0 is the configuration: the context window Hermes requires, in the
+memory a 16 GB Mac has.**
